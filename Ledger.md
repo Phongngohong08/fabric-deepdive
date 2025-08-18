@@ -6,11 +6,18 @@ Một ledger trong Hyperledger Fabric lưu trữ thông tin sự kiện (facts) 
 
 ### What is a Ledger?
 
-Ledger thể hiện trạng thái hiện tại (ví dụ số dư) và chuỗi giao dịch theo thứ tự tạo ra trạng thái đó.
+Ledger là sổ ghi chép số hoá của doanh nghiệp:
+- Trạng thái hiện tại (world state) của các đối tượng nghiệp vụ dưới dạng cặp key–value.
+- Dòng thời gian bất biến các giao dịch (blockchain) tạo ra trạng thái hiện tại.
+
+Bạn có thể liên tưởng tới tài khoản ngân hàng: số dư là trạng thái hiện tại; còn sao kê là chuỗi giao dịch dẫn tới số dư đó.
 
 ### Ledgers, Facts, and States
 
-Ledger không lưu trực tiếp đối tượng mà lưu facts về trạng thái của đối tượng và lịch sử các thay đổi. Các ứng dụng tương tác qua smart contract dùng các API get/put/delete state.
+- Ledger lưu "facts" (sự kiện/thuộc tính) về đối tượng, không nhất thiết bản thân đối tượng.
+- Mỗi đối tượng ứng với một hoặc nhiều state (key–value) trong world state.
+- Lịch sử facts là bất biến: chỉ có thể thêm mới (append) qua các giao dịch; không sửa xoá quá khứ.
+- Ứng dụng tương tác qua smart contract bằng các API đọc/ghi/xoá state.
 
 Code minh hoạ (các API state trong Chaincode Shim):
 
@@ -55,7 +62,9 @@ func (s *SmartContract) DeleteAsset(ctx contractapi.TransactionContextInterface,
 
 ### The Ledger
 
-Ledger gồm hai phần liên quan: world state (cơ sở dữ liệu giá trị hiện tại các key) và blockchain (nhật ký giao dịch bất biến, xác định world state).
+Ledger có hai phần liên hệ chặt chẽ:
+- World state: cơ sở dữ liệu các giá trị hiện tại theo key, tối ưu cho truy vấn trực tiếp.
+- Blockchain: nhật ký giao dịch theo block, bất biến, là nguồn gốc để suy ra world state.
 
 Code minh hoạ (tạo block và header cơ bản):
 
@@ -75,7 +84,9 @@ func NewBlock(seqNum uint64, previousHash []byte) *cb.Block {
 
 ### World State
 
-World state lưu giá trị hiện tại của các key (key-value). Ứng dụng truy cập trực tiếp qua các API của smart contract. Phiên bản (version) nội bộ tăng dần để đảm bảo kiểm soát đồng thời.
+- Lưu giá trị hiện tại của các key (key–value) cho mỗi namespace chaincode.
+- Hỗ trợ truy vấn theo range, composite key, hoặc truy vấn JSON khi dùng CouchDB.
+- Mỗi key có version tăng dần; khi commit sẽ kiểm tra xung đột dựa trên version (MVCC), đảm bảo tính nhất quán.
 
 Code minh hoạ (truy vấn theo range trong namespace chaincode):
 
@@ -98,7 +109,9 @@ func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface
 
 ### Blockchain
 
-Blockchain là chuỗi các block liên kết bằng hash. Mỗi block chứa danh sách giao dịch và hash của block trước đó, tạo tính bất biến.
+- Chuỗi các block liên kết bằng hash của header, đảm bảo tính bất biến và phát hiện chỉnh sửa.
+- Mỗi block chứa danh sách giao dịch (block data) và metadata (chữ ký người tạo block, bitmap kết quả validate, ...).
+- Dịch vụ ordering chịu trách nhiệm sắp xếp và cắt block theo thứ tự.
 
 Code minh hoạ (tính hash header và dữ liệu block):
 
@@ -142,7 +155,10 @@ type BlockMetadata struct {
 
 ### Blocks
 
-Block gồm: Header (Number, DataHash, PreviousHash), Data (danh sách giao dịch), Metadata (chữ ký, bitmap valid/invalid, vv.).
+Một block có 3 phần:
+- Header: Number, DataHash (hash của phần Data), PreviousHash (hash header block trước).
+- Data: danh sách các giao dịch (mảng các envelope bytes).
+- Metadata: thông tin chữ ký người tạo block, bitmap valid/invalid của từng giao dịch, hash tích luỹ trạng thái để phát hiện fork, v.v.
 
 Code minh hoạ (tuần tự hoá thành phần block):
 
@@ -164,7 +180,12 @@ func addHeaderBytes(h *common.BlockHeader, buf []byte) []byte {
 
 ### Transactions
 
-Một giao dịch gồm header, chữ ký, proposal input, response (RW-set) và các endorsements. RW-set mô tả các đọc/ghi mà smart contract thực hiện.
+Một giao dịch endorser trong Fabric gồm các phần chính:
+- Header: metadata như loại giao dịch, channel, TxID, timestamp, epoch.
+- Signature: chữ ký số của client, chống giả mạo.
+- Proposal input (chaincode invocation spec): tham số đầu vào cho smart contract.
+- Response: kết quả thực thi smart contract chứa Read-Write set (RW-set).
+- Endorsements: tập chữ ký từ các tổ chức theo chính sách endorsement; chỉ khi đủ chữ ký thì giao dịch mới được coi là hợp lệ để cập nhật world state.
 
 Code minh hoạ (cấu trúc dùng trong validate, bao gồm RW-set):
 
@@ -179,9 +200,42 @@ type transaction struct {
 }
 ```
 
+Code minh hoạ (các struct bao bọc giao dịch ở lớp protobuf: Payload/Envelope/ChannelHeader/SignatureHeader):
+
+```go
+// vendor/github.com/hyperledger/fabric-protos-go-apiv2/common/common.pb.go (trích)
+type Payload struct {
+    Header *Header // gồm ChannelHeader và SignatureHeader (dạng bytes)
+    Data   []byte  // nội dung theo loại trong header (ví dụ EndorserTransaction)
+}
+
+type Envelope struct {
+    Payload   []byte // marshaled Payload
+    Signature []byte // chữ ký của creator trong Header
+}
+
+type ChannelHeader struct {
+    Type        int32
+    Version     int32
+    Timestamp   *timestamppb.Timestamp
+    ChannelId   string
+    TxId        string
+    Epoch       uint64
+    Extension   []byte
+    TlsCertHash []byte
+}
+
+type SignatureHeader struct {
+    Creator []byte // MSP SerializedIdentity
+    Nonce   []byte // chống replay
+}
+```
+
 ### World State database options
 
-World state có thể dùng LevelDB (mặc định, nhúng) hoặc CouchDB (ngoài tiến trình, hỗ trợ JSON query). Cấu hình qua `StateDBConfig`.
+- LevelDB: mặc định, nhúng trong tiến trình peer, phù hợp key–value đơn giản, hiệu năng cao.
+- CouchDB: tiến trình riêng, phù hợp dữ liệu JSON và truy vấn phong phú (selector, index); vẫn trong suốt với smart contract.
+- Fabric "pluggable": có thể thay thế backend trong tương lai (quan hệ, đồ thị, thời gian, ...).
 
 Code minh hoạ (cấu hình StateDB và CouchDB):
 
@@ -241,7 +295,9 @@ func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface
 
 ### Namespaces
 
-Mỗi chaincode có namespace state riêng; blockchain không namespaced. Với private data, mỗi collection có không gian khoá riêng.
+- Mỗi chaincode có namespace riêng trong world state, cô lập dữ liệu giữa các chaincode.
+- Blockchain không namespaced: một block có thể chứa giao dịch từ nhiều namespace khác nhau.
+- Private data: mỗi collection là một không gian khoá tách biệt (với hậu tố $$p/$$h khi dùng CouchDB) cùng chính sách truy cập riêng.
 
 Code minh hoạ (bố cục key trong lifecycle và collection key):
 
@@ -267,7 +323,8 @@ func BuildCollectionKVSKey(ccname string) string { return ccname + collectionSep
 
 ### Channels
 
-Mỗi channel có một ledger riêng (blockchain + world state). Khi dùng CouchDB, tên DB có chứa tên kênh để tách biệt.
+- Mỗi channel có ledger riêng hoàn toàn (blockchain + world state + namespaces).
+- Có thể trao đổi thông tin giữa các channel qua chaincode-to-chaincode hoặc ứng dụng, nhưng commit và validate vẫn độc lập.
 
 Code minh hoạ (đặt tên DB CouchDB theo chain/channel):
 
