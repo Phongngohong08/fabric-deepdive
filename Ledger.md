@@ -66,6 +66,17 @@ Ledger có hai phần liên hệ chặt chẽ:
 - World state: cơ sở dữ liệu các giá trị hiện tại theo key, tối ưu cho truy vấn trực tiếp.
 - Blockchain: nhật ký giao dịch theo block, bất biến, là nguồn gốc để suy ra world state.
 
+Code minh hoạ (struct `cb.Block` tối giản):
+
+```go
+// vendor/github.com/hyperledger/fabric-protos-go-apiv2/common/common.pb.go (trích)
+type Block struct {
+    Header   *BlockHeader
+    Data     *BlockData
+    Metadata *BlockMetadata
+}
+```
+
 Code minh hoạ (tạo block và header cơ bản):
 
 ```go
@@ -106,6 +117,12 @@ func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface
     return assets, nil
 }
 ```
+
+Giải thích ngắn về MVCC (Multi-Version Concurrency Control):
+- Khi smart contract được endorse, hệ thống ghi lại Read-Write set (RW-set), trong đó Read set chứa cặp (key, version) của tất cả các key đã đọc.
+- Khi commit block, peer sẽ kiểm tra version hiện tại của mỗi key khớp với version trong Read set. Nếu có giao dịch khác đã cập nhật key đó sau thời điểm endorse, version bị lệch và giao dịch sẽ bị đánh dấu không hợp lệ (MVCC read conflict) và không cập nhật world state.
+- Với truy vấn theo range hoặc truy vấn JSON (CouchDB), Fabric thêm thông tin phạm vi truy vấn và/hoặc hash kết quả vào Read set để phát hiện phantom reads. Nếu có key được thêm/xoá/đổi trong phạm vi truy vấn giữa lúc endorse và commit, giao dịch cũng sẽ bị vô hiệu.
+- Ưu điểm: song song hoá cao, tránh khoá dài; Nhược điểm: có thể bị xung đột và phải gửi lại. Thực tiễn: chia nhỏ giao dịch, dùng kiểm tra điều kiện (check-and-set) trên giá trị/phiên bản, thiết kế khoá logic, và tận dụng chỉ mục/truy vấn phù hợp khi dùng CouchDB.
 
 ### Blockchain
 
@@ -152,6 +169,12 @@ type BlockMetadata struct {
     Metadata [][]byte // các metadata: chữ ký, bitmap valid/invalid, v.v.
 }
 ```
+
+Giải thích thêm (tính bất biến và toàn vẹn trong Blockchain):
+- Header của mỗi block chứa `DataHash` (hash của toàn bộ phần Data) và `PreviousHash` (hash header block trước). Khi bất kỳ byte nào trong Data bị thay đổi, `DataHash` khác đi, kéo theo hash header khác, làm đứt chuỗi hash về sau. Vì vậy sổ cái là bất biến theo nghĩa "tamper-evident" (mọi sửa đổi đều bị phát hiện).
+- `BlockMetadata` không tham gia vào hash header nhằm tách biệt dữ liệu giao dịch (được băm và xâu chuỗi) với siêu dữ liệu thêm sau (chữ ký người tạo block, bitmap hợp lệ/không hợp lệ, v.v.). Siêu dữ liệu vẫn được bảo vệ bằng chữ ký và quy trình xác thực khi commit.
+- Dịch vụ ordering sắp xếp giao dịch, cắt block, và thường ký khối (tuỳ cơ chế). Peer khi nhận block sẽ: (1) kiểm tra chữ ký/siêu dữ liệu, (2) xác minh hash header (bao gồm `PreviousHash`), (3) validate từng giao dịch, (4) commit block kèm cờ valid/invalid vào metadata.
+- Hệ quả bảo mật: kẻ tấn công không thể đơn phương sửa block ở một peer rồi thuyết phục mạng; vì chuỗi hash và chữ ký/đồng thuận đảm bảo tất cả nút phải nhất quán thứ tự và nội dung khối.
 
 ### Blocks
 
