@@ -113,6 +113,118 @@ Code minh hoạ (khởi tạo MSPManager với danh sách MSP):
 func (mgr *mspManagerImpl) Setup(msps []MSP) error { // Lưu map[MSPID]MSP, sắp xếp theo ProviderType, đánh dấu up=true }
 ```
 
+### MSP trong cấu hình peer/orderer (core.yaml, orderer.yaml)
+
+- **Peer (core.yaml)**
+  - **Local MSP**: `mspConfigPath`, `localMspId`, `localMspType`
+
+```353:365:sampleconfig/core.yaml
+  # Path on the file system where peer will find MSP local configurations
+  # The path may be relative to FABRIC_CFG_PATH or an absolute path.
+  mspConfigPath: msp
+
+  # Identifier of the local MSP
+  # ----!!!!IMPORTANT!!!-!!!IMPORTANT!!!-!!!IMPORTANT!!!!----
+  # Deployers need to change the value of the localMspId string.
+  # In particular, the name of the local MSP ID of a peer needs
+  # to match the name of one of the MSPs in each of the channel
+  # that this peer is a member of. Otherwise this peer's messages
+  # will not be identified as valid by other nodes.
+  localMspId: SampleOrg
+```
+
+```413:415:sampleconfig/core.yaml
+  # Type for the local MSP - by default it's of type bccsp
+  localMspType: bccsp
+```
+
+  - **TLS cho peer**: bật `tls.enabled`, tuỳ chọn mTLS với `tls.clientAuthRequired`; có thể chỉ định CA bổ sung qua `rootcert`/`clientRootCAs`.
+
+```272:307:sampleconfig/core.yaml
+  # TLS Settings
+  tls:
+    enabled: false
+    clientAuthRequired: false
+    cert:
+      file: tls/server.crt
+    key:
+      file: tls/server.key
+    rootcert:
+      file: tls/ca.crt
+    clientRootCAs:
+      files:
+        - tls/ca.crt
+    clientKey:
+      file:
+    clientCert:
+      file:
+```
+
+  - **BCCSP (crypto)**: chọn `SW` (mặc định) hoặc `PKCS11` (HSM). Nếu `FileKeyStore.KeyStore` rỗng, mặc định dùng `mspConfigPath/keystore`.
+
+```323:338:sampleconfig/core.yaml
+  # BCCSP (Blockchain crypto provider): Select which crypto implementation or
+  # library to use
+  BCCSP:
+    Default: SW
+    SW:
+      Hash: SHA2
+      Security: 256
+      FileKeyStore:
+        # If "", defaults to 'mspConfigPath'/keystore
+        KeyStore:
+    PKCS11:
+      Library:
+      Label:
+      Pin:
+      Hash:
+      Security:
+```
+
+- **Orderer (orderer.yaml)**
+  - **Local MSP**: `General.LocalMSPDir`, `General.LocalMSPID`
+
+```130:138:sampleconfig/orderer.yaml
+  # LocalMSPDir is where to find the private crypto material needed by the
+  # orderer. It is set relative here as a default for dev environments but
+  # should be changed to the real location in production.
+  LocalMSPDir: msp
+
+  # LocalMSPID is the identity to register the local MSP material with the MSP
+  # manager. The sample organization defined in the
+  # sample configuration provided has an MSP ID of "SampleOrg".
+  LocalMSPID: SampleOrg
+```
+
+  - **TLS cho orderer**: `General.TLS.Enabled`, `ClientAuthRequired`, và CA bổ sung `RootCAs`/`ClientRootCAs`.
+
+```21:42:sampleconfig/orderer.yaml
+  # TLS: TLS settings for the GRPC server.
+  TLS:
+    Enabled: false
+    PrivateKey: tls/server.key
+    Certificate: tls/server.crt
+    RootCAs:
+      - tls/ca.crt
+    ClientAuthRequired: false
+    ClientRootCAs:
+```
+
+  - **BCCSP (crypto)**: tương tự peer; `SW` mặc định, cấu hình `PKCS11` khi dùng HSM.
+
+```146:167:sampleconfig/orderer.yaml
+  # BCCSP configures the blockchain crypto service providers.
+  BCCSP:
+    Default: SW
+
+    # SW configures the software based blockchain crypto provider.
+    SW:
+      Hash: SHA2
+      Security: 256
+      FileKeyStore:
+        KeyStore:
+```
+
 ---
 
 Ghi chú:

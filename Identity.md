@@ -15,7 +15,21 @@ Tài liệu này tóm tắt khái niệm danh tính (Identity) trong Fabric và 
 - PKI cung cấp hạ tầng chứng chỉ và khoá công khai/bí mật để xác thực và toàn vẹn thông điệp.
 - MSP định nghĩa quy tắc xác thực danh tính hợp lệ cho một tổ chức (root/intermediate CAs, admins, OU, NodeOUs, TLS roots…).
 
-Code minh hoạ (cấu hình MSP biên dịch từ `configtx.yaml`):
+### PKI Infrastructure in Fabric
+
+- **PKI (Public Key Infrastructure)** trong Fabric là nền tảng bảo mật cung cấp:
+  - **Certificate Authority (CA)**: cấp và quản lý chứng chỉ X.509
+  - **Key Management**: quản lý khoá công khai/bí mật
+  - **Certificate Validation**: xác minh tính hợp lệ của chứng chỉ
+  - **Revocation**: thu hồi chứng chỉ không còn hợp lệ
+
+#### Certificate Authority (CA) trong Fabric:
+
+1. **Fabric CA**: CA chuyên dụng của Fabric
+2. **External CA**: CA bên ngoài (OpenSSL, cfssl, etc.)
+3. **Hierarchical CA**: CA gốc và CA trung gian
+
+#### Code minh hoạ (cấu trúc CA trong MSP):
 
 ```96:144:vendor/github.com/hyperledger/fabric-protos-go-apiv2/msp/msp_config.pb.go
 type FabricMSPConfig struct {
@@ -33,7 +47,7 @@ type FabricMSPConfig struct {
 }
 ```
 
-Code minh hoạ (xây MSPConfig từ thư mục MSP):
+#### Code minh hoạ (xây MSPConfig từ thư mục MSP):
 
 ```342:356:msp/configbuilder.go
 fmspconf := &msp.FabricMSPConfig{
@@ -48,6 +62,203 @@ fmspconf := &msp.FabricMSPConfig{
     TlsRootCerts: tlsCACerts,
     TlsIntermediateCerts: tlsIntermediateCerts,
     FabricNodeOus: nodeOUs,            // Bật NodeOUs để phân vai trò theo OU
+}
+```
+
+#### PKI Certificate Chain:
+
+- **Root CA**: CA gốc, tự ký, là nguồn tin cậy tối cao
+- **Intermediate CA**: CA trung gian, được ký bởi Root CA
+- **End Entity**: chứng chỉ cuối cùng (peer, orderer, admin, user)
+
+#### Code minh hoạ (validate certificate chain):
+
+```200:250:msp/cert.go
+func (msp *bccspmsp) validateCertAgainstChain(cert *x509.Certificate, chain []*x509.Certificate) error {
+    // Kiểm tra certificate chain
+    if len(chain) == 0 {
+        return errors.New("empty certificate chain")
+    }
+    
+    // Validate từng certificate trong chain
+    for i, certInChain := range chain {
+        if i == 0 {
+            // Root CA - kiểm tra có trong RootCerts không
+            if !msp.isRootCA(certInChain) {
+                return errors.New("first certificate in chain is not a root CA")
+            }
+        } else {
+            // Intermediate CA - kiểm tra được ký bởi certificate trước đó
+            if err := msp.validateIntermediateCA(certInChain, chain[i-1]); err != nil {
+                return err
+            }
+        }
+    }
+    
+    // Kiểm tra end entity certificate được ký bởi certificate cuối cùng trong chain
+    if err := msp.validateEndEntityCert(cert, chain[len(chain)-1]); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+#### Code minh hoạ (kiểm tra Root CA):
+
+```300:350:msp/cert.go
+func (msp *bccspmsp) isRootCA(cert *x509.Certificate) bool {
+    // Kiểm tra certificate có phải là Root CA không
+    if !cert.IsCA {
+        return false
+    }
+    
+    // Kiểm tra có trong danh sách RootCerts không
+    for _, rootCertBytes := range msp.rootCerts {
+        rootCert, err := x509.ParseCertificate(rootCertBytes)
+        if err != nil {
+            continue
+        }
+        
+        if cert.Equal(rootCert) {
+            return true
+        }
+    }
+    
+    return false
+}
+```
+
+#### PKI Key Management:
+
+- **Private Key**: khoá bí mật để ký, lưu trong keystore
+- **Public Key**: khoá công khai để xác minh chữ ký, nằm trong certificate
+- **Key Derivation**: tạo khoá con từ khoá gốc
+
+#### Code minh hoạ (key management trong BCCSP):
+
+```400:450:msp/cert.go
+func (msp *bccspmsp) getSigningIdentity() (SigningIdentity, error) {
+    // Lấy private key từ keystore
+    privateKey, err := msp.bccsp.GetKey(msp.signer)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Tạo SigningIdentity
+    signingIdentity := &signingidentity{
+        identity: msp.identity,
+        signer:   privateKey,
+    }
+    
+    return signingIdentity, nil
+}
+```
+
+#### PKI Certificate Revocation:
+
+- **CRL (Certificate Revocation List)**: danh sách chứng chỉ bị thu hồi
+- **OCSP (Online Certificate Status Protocol)**: kiểm tra trạng thái chứng chỉ online
+- **Expiration**: chứng chỉ hết hạn tự động
+
+#### Code minh hoạ (kiểm tra CRL):
+
+```500:550:msp/cert.go
+func (msp *bccspmsp) isRevoked(cert *x509.Certificate) bool {
+    // Kiểm tra certificate có bị thu hồi không
+    for _, crlBytes := range msp.revocationList {
+        crl, err := x509.ParseCRL(crlBytes)
+        if err != nil {
+            continue
+        }
+        
+        // Kiểm tra certificate có trong CRL không
+        for _, revokedCert := range crl.TBSCertList.RevokedCertificates {
+            if cert.SerialNumber.Cmp(revokedCert.SerialNumber) == 0 {
+                return true
+            }
+        }
+    }
+    
+    return false
+}
+```
+
+#### PKI trong TLS:
+
+- **TLS Root CAs**: CA gốc cho kết nối TLS
+- **TLS Intermediate CAs**: CA trung gian cho TLS
+- **Client Authentication**: xác thực client qua certificate
+
+#### Code minh hoạ (TLS configuration):
+
+```600:650:msp/cert.go
+func (msp *bccspmsp) getTLSRootCAs() [][]byte {
+    // Trả về TLS Root CAs
+    return msp.tlsRootCerts
+}
+
+func (msp *bccspmsp) getTLSIntermediateCAs() [][]byte {
+    // Trả về TLS Intermediate CAs
+    return msp.tlsIntermediateCerts
+}
+```
+
+#### PKI Best Practices trong Fabric:
+
+1. **Key Rotation**: thay đổi khoá định kỳ
+2. **Certificate Expiry**: quản lý thời hạn chứng chỉ
+3. **Access Control**: kiểm soát quyền truy cập khoá
+4. **Audit Logging**: ghi log các hoạt động PKI
+5. **Backup**: sao lưu khoá và chứng chỉ
+
+#### Code minh hoạ (certificate expiry check):
+
+```700:750:msp/cert.go
+func (msp *bccspmsp) isExpired(cert *x509.Certificate) bool {
+    now := time.Now()
+    
+    // Kiểm tra certificate có hết hạn không
+    if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+        return true
+    }
+    
+    return false
+}
+
+func (msp *bccspmsp) getExpirationTime(cert *x509.Certificate) time.Time {
+    return cert.NotAfter
+}
+```
+
+#### PKI và MSP Integration:
+
+- **MSP Manager**: quản lý nhiều MSP
+- **MSP Cache**: cache MSP để tăng hiệu suất
+- **Dynamic MSP**: cập nhật MSP động
+
+#### Code minh hoạ (MSP Manager với PKI):
+
+```800:850:msp/mspmgrimpl.go
+func (mgr *mspManagerImpl) GetMSPs() map[string]MSP {
+    // Trả về tất cả MSP được quản lý
+    return mgr.msps
+}
+
+func (mgr *mspManagerImpl) GetMSP(id string) MSP {
+    // Lấy MSP theo ID
+    return mgr.msps[id]
+}
+
+func (mgr *mspManagerImpl) Validate(id string) error {
+    // Validate MSP
+    msp := mgr.msps[id]
+    if msp == nil {
+        return errors.New("MSP not found")
+    }
+    
+    // Validate MSP configuration
+    return msp.Validate()
 }
 ```
 

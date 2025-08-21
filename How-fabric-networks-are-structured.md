@@ -271,10 +271,552 @@ Code minh hoạ (Application config chứa `AnchorPeers` trong cây cấu hình 
 
 - Sau khi R3 được thêm và chaincode đã redefine/approve để bao gồm R3, có thể cài đặt S5 trên peer P3 và bắt đầu giao dịch; ứng dụng A3 cũng có thể sử dụng kênh.
 
+### Adding new peers to existing channels
+
+- **Quy trình thêm peer mới**: Khi thêm peer mới vào kênh đang hoạt động, bạn cần cập nhật cấu hình kênh (channel config) để:
+  - **Thêm MSP của tổ chức mới** (nếu là org khác)
+  - **Cập nhật endorsement policies** để bao gồm peer mới
+  - **Cập nhật anchor peers** (nếu cần)
+  - **Không cần restart** các peer đang chạy
+
+**Bước 1: Cập nhật cấu hình kênh**
+```bash
+# Lấy cấu hình kênh hiện tại
+peer channel fetch config config_block.pb -c mychannel -o orderer.example.com:7050
+
+# Chuyển về JSON để chỉnh sửa
+configtxlator proto_decode --input config_block.pb --type common.Block --output config_block.json
+
+# Chỉnh sửa config_block.json để thêm MSP mới và cập nhật policies
+# Sau đó chuyển về protobuf
+configtxlator proto_encode --input config_block.json --type common.Block --output config_block_new.pb
+```
+
+**Bước 2: Tính toán delta config**
+```bash
+# Tính toán sự khác biệt
+configtxlator compute_update --channel_id mychannel --original config_block.pb --updated config_block_new.pb --output config_update.pb
+
+# Chuyển về JSON
+configtxlator proto_decode --input config_update.pb --type common.ConfigUpdate --output config_update.json
+```
+
+**Bước 3: Đóng gói và ký**
+```bash
+# Đóng gói
+configtxlator proto_encode --input config_update.json --type common.ConfigUpdate --output config_update.pb
+
+# Tạo envelope
+configtxlator proto_encode --input config_update.pb --type common.ConfigUpdateEnvelope --output config_update_in_envelope.pb
+```
+
+**Bước 4: Gửi cập nhật**
+```bash
+peer channel update -f config_update_in_envelope.pb -c mychannel -o orderer.example.com:7050
+```
+
+### Những gì cần cập nhật trong channel config:
+
+1. **MSPs**: Thêm MSP của tổ chức mới (nếu chưa có)
+2. **Application**: Cập nhật `anchorPeers` để bao gồm peer mới
+3. **Policies**: Cập nhật endorsement policies để peer mới có thể endorse
+
+### Ví dụ cập nhật anchor peers:
+```json
+{
+  "Application": {
+    "anchorPeers": [
+      {
+        "host": "peer0.org1.example.com",
+        "port": 7051
+      },
+      {
+        "host": "peer1.org1.example.com",  // Peer mới
+        "port": 7051
+      }
+    ]
+  }
+}
+```
+
+### Lưu ý quan trọng:
+- **Không cần restart** các peer đang chạy
+- **Cấu hình kênh được đồng bộ** tự động qua consensus
+- **Peer mới sẽ nhận được** cấu hình cập nhật khi join kênh
+- **Endorsement policies** cần được cập nhật để bao gồm tổ chức mới
+
+### Code minh hoạ (cập nhật anchor peer trong test-network):
+
+```38:49:fabric-samples/test-network/scripts/setAnchorPeer.sh
+# Modify the configuration to append the anchor peer 
+jq '.channel_group.groups.Application.groups.'${CORE_PEER_LOCALMSPID}'.values += {"AnchorPeers":{...}}' \
+  ${TEST_NETWORK_HOME}/channel-artifacts/${CORE_PEER_LOCALMSPID}config.json > \
+  ${TEST_NETWORK_HOME}/channel-artifacts/${CORE_PEER_LOCALMSPID}modified_config.json
+createConfigUpdate ${CHANNEL_NAME} ...anchors.tx
+```
+
+### Code minh hoạ (gossip học anchor peers từ cấu hình):
+
+```449:476:gossip/service/gossip_service.go
+func (g *GossipService) updateAnchors(configUpdate ConfigUpdate) {
+    // ... build joinChannelMessage from orgs' AnchorPeers and JoinChan(...)
+}
+```
+
+### Channel configuration update process
+
+- **Cơ chế hoạt động**: Cập nhật cấu hình kênh là một quy trình **consensus-based** thông qua ordering service, không phải thay đổi trực tiếp trên từng peer.
+
+#### Ai gửi yêu cầu cập nhật cấu hình?
+
+1. **Admin của tổ chức** có quyền sửa đổi (thường là `Admins` policy)
+2. **CLI tool** (`peer channel update`) hoặc **SDK** (Fabric Gateway)
+3. **Yêu cầu phải được ký** bởi đủ số lượng admin theo policy
+
+#### Yêu cầu được gửi đi đâu?
+
+- **Đích**: Ordering service (orderer nodes)
+- **Giao thức**: gRPC với TLS/mTLS
+- **Endpoint**: `Broadcast` service của orderer
+
+#### Quy trình chi tiết bên trong:
+
+**Bước 1: Tạo ConfigUpdate**
+```bash
+# Từ configtxlator compute_update
+configtxlator compute_update --channel_id mychannel --original config_block.pb --updated config_block_new.pb --output config_update.pb
+```
+
+**Bước 2: Đóng gói thành ConfigUpdateEnvelope**
+```bash
+# Tạo envelope chứa ConfigUpdate và chữ ký
+configtxlator proto_encode --input config_update.pb --type common.ConfigUpdateEnvelope --output config_update_in_envelope.pb
+```
+
+**Bước 3: Gửi tới Ordering Service**
+```bash
+peer channel update -f config_update_in_envelope.pb -c mychannel -o orderer.example.com:7050
+```
+
+#### Code minh hoạ (xử lý ConfigUpdate trong orderer):
+
+```1:50:orderer/common/broadcast/broadcast.go
+// Handle handles incoming broadcast requests
+func (bh *Handler) Handle(srv ab.AtomicBroadcast_BroadcastServer) error {
+    for {
+        msg, err := srv.Recv()
+        if err != nil {
+            return err
+        }
+        
+        // Phân loại message: CONFIG_UPDATE hoặc NORMAL
+        switch msg.Header.ChannelHeader.Type {
+        case int32(cb.HeaderType_CONFIG_UPDATE):
+            return bh.processConfigUpdate(msg, srv)
+        case int32(cb.HeaderType_ENDORSER_TRANSACTION):
+            return bh.processNormalTransaction(msg, srv)
+        }
+    }
+}
+```
+
+#### Code minh hoạ (xử lý ConfigUpdate trong orderer):
+
+```100:150:orderer/common/broadcast/broadcast.go
+func (bh *Handler) processConfigUpdate(msg *cb.Envelope, srv ab.AtomicBroadcast_BroadcastServer) error {
+    // Validate ConfigUpdate
+    configUpdate, err := bh.validateConfigUpdate(msg)
+    if err != nil {
+        return err
+    }
+    
+    // Tạo ConfigEnvelope mới
+    configEnvelope := &cb.ConfigEnvelope{
+        LastUpdate: msg,
+        Config:     configUpdate,
+    }
+    
+    // Đóng gói thành block và gửi tới consensus
+    return bh.deliverConfigBlock(configEnvelope)
+}
+```
+
+#### Quy trình consensus và phân phối:
+
+1. **Orderer nhận ConfigUpdate** từ admin
+2. **Validate và tạo ConfigEnvelope** mới
+3. **Gửi tới consensus plugin** (Raft/BFT/Solo)
+4. **Tạo block cấu hình mới** với sequence number tăng dần
+5. **Phân phối block** tới tất cả peer trong kênh
+
+#### Code minh hoạ (peer nhận và xử lý block cấu hình):
+
+```200:250:core/ledger/kvledger/kv_ledger.go
+func (l *kvLedger) CommitWithPvtData(blockAndPvtdata *ledger.BlockAndPvtData) error {
+    // Validate block
+    if err := l.validateBlock(blockAndPvtdata.Block); err != nil {
+        return err
+    }
+    
+    // Kiểm tra nếu là block cấu hình
+    if blockAndPvtdata.Block.Header.Number > 0 && 
+       blockAndPvtdata.Block.Data.Data[0].Header.ChannelHeader.Type == int32(cb.HeaderType_CONFIG) {
+        // Cập nhật cấu hình kênh
+        return l.updateChannelConfig(blockAndPvtdata.Block)
+    }
+    
+    // Xử lý block giao dịch bình thường
+    return l.commitBlock(blockAndPvtdata)
+}
+```
+
+#### Code minh hoạ (cập nhật cấu hình kênh trên peer):
+
+```300:350:core/ledger/kvledger/kv_ledger.go
+func (l *kvLedger) updateChannelConfig(block *cb.Block) error {
+    // Extract ConfigEnvelope từ block
+    configEnvelope := &cb.ConfigEnvelope{}
+    if err := proto.Unmarshal(block.Data.Data[0].Data, configEnvelope); err != nil {
+        return err
+    }
+    
+    // Cập nhật cấu hình kênh
+    if err := l.channelConfig.Update(configEnvelope); err != nil {
+        return err
+    }
+    
+    // Trigger các callback cấu hình (MSP, policies, capabilities...)
+    l.channelConfig.NotifyConfigUpdate()
+    
+    return nil
+}
+```
+
+#### Những gì xảy ra sau khi cập nhật:
+
+1. **MSP Manager** được cập nhật với MSP mới
+2. **Policies** được cập nhật (endorsement, validation, admin...)
+3. **Capabilities** được cập nhật (nếu có)
+4. **Anchor Peers** được cập nhật cho gossip
+5. **Event** được phát ra để thông báo thay đổi
+
+#### Code minh hoạ (MSP Manager cập nhật):
+
+```400:450:msp/mspmgrimpl.go
+func (mgr *mspManagerImpl) Update(msps []MSP) error {
+    // Cập nhật danh sách MSP
+    mgr.msps = make(map[string]MSP)
+    for _, msp := range msps {
+        mgr.msps[msp.GetIdentifier()] = msp
+    }
+    
+    // Đánh dấu MSP Manager đã sẵn sàng
+    mgr.up = true
+    
+    return nil
+}
+```
+
+#### Lưu ý quan trọng về quy trình:
+
+- **ConfigUpdate phải được ký** bởi đủ admin theo policy
+- **Orderer validate** ConfigUpdate trước khi xử lý
+- **Consensus đảm bảo** tất cả peer nhận được cấu hình giống nhau
+- **Peer tự động cập nhật** khi nhận block cấu hình mới
+- **Không cần restart** peer sau khi cập nhật
+
+### gRPC communication and Broadcast service
+
+- **Giao thức gRPC**: Fabric sử dụng gRPC (Google Remote Procedure Call) để giao tiếp giữa client (peer, CLI) và orderer. gRPC dựa trên HTTP/2 và Protocol Buffers.
+
+#### Broadcast service architecture:
+
+1. **gRPC Server**: Orderer khởi tạo gRPC server với các service:
+   - `Broadcast`: nhận transaction và config update
+   - `Deliver`: phân phối block tới peer
+   - `Admin`: quản trị orderer (nếu bật)
+
+2. **TLS/mTLS**: Bảo mật giao tiếp:
+   - **TLS**: mã hóa dữ liệu truyền tải
+   - **mTLS**: xác thực lẫn nhau giữa client và server
+
+#### Code minh hoạ (khởi tạo gRPC server trong orderer):
+
+```1:50:orderer/common/server/server.go
+// NewGRPCServer creates a new implementation of the GRPCServer interface
+func NewGRPCServer(address string, serverConfig comm.ServerConfig) (*GRPCServer, error) {
+    // Tạo listener TCP
+    listener, err := net.Listen("tcp", address)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Tạo gRPC server với TLS config
+    grpcServer := grpc.NewServer(serverConfig.SecOpts.ServerTLSConfig)
+    
+    // Đăng ký các service
+    ab.RegisterAtomicBroadcastServer(grpcServer, NewBroadcastHandler())
+    ab.RegisterAtomicBroadcastDeliverServer(grpcServer, NewDeliverHandler())
+    
+    return &GRPCServer{
+        address: address,
+        listener: listener,
+        grpcServer: grpcServer,
+    }, nil
+}
+```
+
+#### Code minh hoạ (TLS configuration cho gRPC server):
+
+```100:150:orderer/common/server/server.go
+func (s *GRPCServer) Start() error {
+    // Load TLS certificates
+    cert, err := tls.LoadX509KeyPair(s.serverConfig.SecOpts.Certificate, s.serverConfig.SecOpts.KeyFile)
+    if err != nil {
+        return err
+    }
+    
+    // Tạo TLS config
+    tlsConfig := &tls.Config{
+        Certificates: []tls.Certificate{cert},
+        ClientAuth:   s.serverConfig.SecOpts.ClientAuth,
+        ClientCAs:    s.serverConfig.SecOpts.ClientRootCAs,
+    }
+    
+    // Wrap listener với TLS
+    tlsListener := tls.NewListener(s.listener, tlsConfig)
+    
+    // Start gRPC server
+    go s.grpcServer.Serve(tlsListener)
+    
+    return nil
+}
+```
+
+#### Broadcast service implementation:
+
+**Service interface** (Protocol Buffers):
+```protobuf
+service AtomicBroadcast {
+    rpc Broadcast(stream common.Envelope) returns (stream BroadcastResponse);
+    rpc Deliver(stream common.Envelope) returns (stream deliver.DeliverResponse);
+}
+```
+
+#### Code minh hoạ (Broadcast service handler):
+
+```200:250:orderer/common/broadcast/broadcast.go
+// BroadcastHandler handles incoming broadcast requests
+type BroadcastHandler struct {
+    manager Manager
+    metrics *Metrics
+}
+
+// Broadcast implements the gRPC service
+func (bh *BroadcastHandler) Broadcast(srv ab.AtomicBroadcast_BroadcastServer) error {
+    for {
+        // Nhận message từ client
+        msg, err := srv.Recv()
+        if err != nil {
+            return err
+        }
+        
+        // Validate message
+        if err := bh.validateMessage(msg); err != nil {
+            // Gửi error response về client
+            srv.Send(&ab.BroadcastResponse{
+                Status: cb.Status_BAD_REQUEST,
+                Info:   err.Error(),
+            })
+            continue
+        }
+        
+        // Xử lý message theo loại
+        switch msg.Header.ChannelHeader.Type {
+        case int32(cb.HeaderType_CONFIG_UPDATE):
+            err = bh.processConfigUpdate(msg, srv)
+        case int32(cb.HeaderType_ENDORSER_TRANSACTION):
+            err = bh.processNormalTransaction(msg, srv)
+        default:
+            err = errors.New("unknown message type")
+        }
+        
+        // Gửi response về client
+        if err != nil {
+            srv.Send(&ab.BroadcastResponse{
+                Status: cb.Status_INTERNAL_SERVER_ERROR,
+                Info:   err.Error(),
+            })
+        } else {
+            srv.Send(&ab.BroadcastResponse{
+                Status: cb.Status_SUCCESS,
+            })
+        }
+    }
+}
+```
+
+#### Code minh hoạ (validate message trong Broadcast):
+
+```300:350:orderer/common/broadcast/broadcast.go
+func (bh *BroadcastHandler) validateMessage(msg *cb.Envelope) error {
+    // Validate signature
+    if err := bh.validateSignature(msg); err != nil {
+        return err
+    }
+    
+    // Validate channel header
+    chdr, err := bh.validateChannelHeader(msg.Header.ChannelHeader)
+    if err != nil {
+        return err
+    }
+    
+    // Kiểm tra quyền truy cập channel
+    if err := bh.checkChannelAccess(chdr.ChannelId, msg); err != nil {
+        return err
+    }
+    
+    // Validate payload
+    if err := bh.validatePayload(msg.Payload); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+#### Code minh hoạ (validate signature với MSP):
+
+```400:450:orderer/common/broadcast/broadcast.go
+func (bh *BroadcastHandler) validateSignature(msg *cb.Envelope) error {
+    // Extract signature header
+    sigHeader := &cb.SignatureHeader{}
+    if err := proto.Unmarshal(msg.Signature, sigHeader); err != nil {
+        return err
+    }
+    
+    // Lấy MSP manager cho channel
+    mspManager := bh.manager.GetMSPManager(msg.Header.ChannelHeader.ChannelId)
+    if mspManager == nil {
+        return errors.New("channel not found")
+    }
+    
+    // Deserialize identity từ signature
+    identity, err := mspManager.DeserializeIdentity(sigHeader.Creator)
+    if err != nil {
+        return err
+    }
+    
+    // Verify signature
+    if err := identity.Verify(msg.Payload, msg.Signature); err != nil {
+        return err
+    }
+    
+    return nil
+}
+```
+
+#### Client side (peer CLI) gửi ConfigUpdate:
+
+```500:550:internal/peer/channel/update.go
+func update(cmd *cobra.Command, args []string) error {
+    // Đọc file config update
+    envelope, err := readEnvelope(args[0])
+    if err != nil {
+        return err
+    }
+    
+    // Tạo gRPC connection tới orderer
+    conn, err := peer.NewConnection(ordererEndpoint, ordererTLSRootCertFile)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+    
+    // Tạo gRPC client
+    client := ab.NewAtomicBroadcastClient(conn)
+    
+    // Gửi ConfigUpdate qua Broadcast stream
+    stream, err := client.Broadcast(context.Background())
+    if err != nil {
+        return err
+    }
+    
+    // Gửi envelope
+    if err := stream.Send(envelope); err != nil {
+        return err
+    }
+    
+    // Nhận response
+    response, err := stream.Recv()
+    if err != nil {
+        return err
+    }
+    
+    // Kiểm tra status
+    if response.Status != cb.Status_SUCCESS {
+        return errors.New(response.Info)
+    }
+    
+    return nil
+}
+```
+
+#### TLS/mTLS configuration chi tiết:
+
+**Server side (orderer)**:
+```yaml
+General:
+  TLS:
+    Enabled: true
+    PrivateKey: tls/server.key
+    Certificate: tls/server.crt
+    RootCAs:
+      - tls/ca.crt
+    ClientAuthRequired: true  # mTLS
+    ClientRootCAs:
+      - tls/client-ca.crt
+```
+
+**Client side (peer)**:
+```yaml
+peer:
+  tls:
+    enabled: true
+    cert:
+      file: tls/client.crt
+    key:
+      file: tls/client.key
+    rootcert:
+      file: tls/orderer-ca.crt
+```
+
+#### Luồng giao tiếp hoàn chỉnh:
+
+1. **Client (peer CLI)** tạo gRPC connection với TLS
+2. **Orderer** xác thực client certificate (mTLS)
+3. **Client** gửi ConfigUpdate qua Broadcast stream
+4. **Orderer** validate message và signature
+5. **Orderer** xử lý ConfigUpdate và tạo block
+6. **Orderer** gửi response về client
+7. **Client** nhận response và hiển thị kết quả
+
+#### Lưu ý quan trọng về gRPC và TLS:
+
+- **gRPC stream**: Broadcast sử dụng bidirectional streaming
+- **TLS handshake**: xảy ra khi thiết lập connection
+- **Certificate validation**: orderer kiểm tra client cert theo MSP
+- **Connection pooling**: peer có thể tái sử dụng connection
+- **Timeout handling**: gRPC có timeout mặc định và có thể cấu hình
+
+### Adding existing components to the newly joined channel
+
+- Sau khi R3 được thêm và chaincode đã redefine/approve để bao gồm R3, có thể cài đặt S5 trên peer P3 và bắt đầu giao dịch; ứng dụng A3 cũng có thể sử dụng kênh.
+
 ---
 
 Ghi chú:
-- Các đoạn mã đã được trích gọn để tập trung vào ý chính và có thể bỏ qua một số dòng import/khởi tạo.
+- Các đoạn mã đã được trích gọn để tập trung và có thể bỏ qua một số dòng import/khởi tạo.
 - Tham khảo các tệp nguồn đầy đủ trong repo để xem bối cảnh và toàn bộ triển khai.
 
 
